@@ -16,18 +16,22 @@
 """
 Pseudo-labelling audio data using the Whisper model in preparation for distillation.
 """
-# You can also adapt this script for your own pseudo-labelling tasks. Pointers for this are left as comments.
-
 import csv
+
+# You can also adapt this script for your own pseudo-labelling tasks. Pointers for this are left as comments.
 import logging
 import os
+import re
+import string
 import sys
 import time
-import warnings
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+import pandas as pd
+from ast import literal_eval
+
 
 import datasets
 import evaluate
@@ -41,11 +45,9 @@ from datasets import (
     IterableDatasetDict,
     load_dataset,
 )
-from huggingface_hub import HfFolder, create_repo, get_full_repo_name, snapshot_download, upload_folder
+from huggingface_hub import HfFolder, Repository, create_repo, get_full_repo_name
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from soundfile import LibsndfileError
-from datasets.arrow_dataset import table_iter
 from transformers import (
     HfArgumentParser,
     Seq2SeqTrainingArguments,
@@ -55,7 +57,7 @@ from transformers import (
     WhisperProcessor,
     WhisperTokenizerFast,
 )
-from transformers.models.whisper.english_normalizer import BasicTextNormalizer, EnglishTextNormalizer
+from transformers.models.whisper.english_normalizer import EnglishTextNormalizer, BasicTextNormalizer
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
@@ -130,45 +132,17 @@ class ModelArguments:
             )
         },
     )
-    attn_implementation: Optional[str] = field(
+    attn_type: Optional[str] = field(
         default=None,
         metadata={
             "help": (
-                "Which attention implementation to use in the encoder and decoder attention layers. Can be one of:\n"
-                "1. `eager` or `None`: default Transformers attention implementation.\n"
-                "2. `sdpa`: Flash Attention through PyTorch SDPA. Requires `torch>=2.1`. Recommended for hardware where Flash Attention 2 is not supported, e.g. Turing GPUs, (T4, RTX 2080).\n"
-                "3. `flash_attn_2`: Flash Attention 2 through the Flash Attention package https://github.com/Dao-AILab/flash-attention. **Always** recommended on supported hardware (Ampere, Ada, or Hopper GPUs, e.g., A100, RTX 3090, RTX 4090, H100)."
+                "Which attention type to use in the encoder and decoder attention layers. Can be one of:"
+                "1. `None`: default Transformers attention implementation."
+                "2. `flash_attn`: Flash Attention through PyTorch SDPA. Requires `torch>=2.0` and `optimum` to be installed. Recommended for hardware where Flash Attention 2 is not supported, e.g. Turing GPUs, (T4, RTX 2080)"
+                "3. `flash_attn_2`: Flash Attention 2 through the Flash Attention package https://github.com/Dao-AILab/flash-attention. **Always** recommended on supported hardware (Ampere, Ada, or Hopper GPUs, e.g., A100, RTX 3090, RTX 4090, H100)"
             )
         },
     )
-    attn_type: Optional[str] = field(
-        default=None,
-        metadata={"help": "Deprecated. Use `attn_implementation` instead."},
-    )
-
-    def __post_init__(self):
-        if self.attn_type is not None and self.attn_implementation is None:
-            # set attn_implementation in a backwards compatible way
-            if self.attn_type == "flash_attn":
-                self.attn_implementation = "sdpa"
-            elif self.attn_type == "flash_attn_2":
-                self.attn_implementation = "flash_attention_2"
-            elif self.attn_type in [None, "eager", "sdpa", "flash_attention_2"]:
-                self.attn_implementation = self.attn_type
-            else:
-                raise ValueError(
-                    f"Argument `--attn_type` is deprecated, and set to an invalid option `{self.attn_type}`. You should omit the argument `--attn_type`, and instead set `-attention_implementation` to one of the following:\n"
-                    "1. `eager` or `None`: default Transformers attention implementation.\n"
-                    "2. `sdpa`: Flash Attention through PyTorch SDPA. Requires `torch>=2.1`. Recommended for hardware where Flash Attention 2 is not supported, e.g. Turing GPUs, (T4, RTX 2080).\n"
-                    "3. `flash_attn_2`: Flash Attention 2 through the Flash Attention package https://github.com/Dao-AILab/flash-attention. **Always** recommended on supported hardware (Ampere, Ada, or Hopper GPUs, e.g., A100, RTX 3090, RTX 4090, H100)."
-                )
-            warnings.warn(
-                f"Argument `--attn_type` is deprecated. Use `--attn_implementation` instead. Inferring `--attn_implementation={self.attn_implementation} from argument `--attn_type={self.attn_type}`."
-            )
-        elif self.attn_type is not None and self.attn_implementation is not None:
-            raise ValueError(
-                "`--attn_type` and `--attn_implementation` are both specified. Only the argument `--attn_implementation`."
-            )
 
 
 @dataclass
@@ -180,6 +154,10 @@ class DataTrainingArguments:
     dataset_name: str = field(
         default=None,
         metadata={"help": "The name of the dataset to use (via the datasets library)."},
+    )
+    load_from_disk: bool = field(
+        default=True,
+        metadata={"help":"Whether to load the data from huggingface hub or load locally saved data."},
     )
     dataset_config_name: Optional[str] = field(
         default=None,
@@ -197,10 +175,6 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
-    preprocessing_batch_size: Optional[int] = field(
-        default=500,
-        metadata={"help": "The batch size to use for the dataset pre-processing."},
-    )
     audio_column_name: str = field(
         default="audio",
         metadata={"help": "The name of the dataset column containing the audio data. Defaults to 'audio'"},
@@ -213,21 +187,9 @@ class DataTrainingArguments:
         default="id",
         metadata={"help": "The name of the dataset column containing the id data. Defaults to 'id'"},
     )
-    speaker_id_column_name: str = field(
-        default=None,
-        metadata={"help": "The name of the dataset column containing the speaker id data. Defaults to None."},
-    )
-    max_duration_in_seconds: float = field(
-        default=30.0,
-        metadata={"help": "Filter audio files that are longer than `max_duration_in_seconds` seconds"},
-    )
     max_label_length: int = field(
-        default=256,
+        default=128,
         metadata={"help": "Truncate transcriptions that are longer `max_label_length` tokens."},
-    )
-    concatenate_audio: bool = field(
-        default=True,
-        metadata={"help": "Whether or not to concatenate the audio samples to `max_duration_in_seconds`."},
     )
     preprocessing_only: bool = field(
         default=False,
@@ -289,21 +251,12 @@ class DataTrainingArguments:
     )
     decode_token_ids: bool = field(
         default=True,
-        metadata={"help": "Deprecated. The predicted token ids should always be decoded to text transcriptions."},
+        metadata={"help": "Whether or not to decode the predicted token ids to text transcriptions."},
     )
     private_dataset: bool = field(
         default=False,
         metadata={"help": "Whether or not to create a private dataset for the pseudo-labelled data."},
     )
-
-    def __post_init__(self):
-        if not self.decode_token_ids:
-            raise ValueError(
-                "The argument `--decode_token_ids` is deprecated. The token ids are now always decoded to "
-                "their corresponding text string. This is following a fix to the merges of the Whisper tokenizer"
-                "on the Hugging Face Hub: https://huggingface.co/openai/whisper-large-v2/discussions/100. "
-                "You should either omit the argument `--decode_token_ids`, or set it to True explicitly."
-            )
 
 
 def shift_tokens_right(label_ids: np.array, decoder_start_token_id: int) -> np.ndarray:
@@ -355,7 +308,10 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         # dataloader returns a list of features which we convert to a dict
         input_features = {model_input_name: [feature[model_input_name] for feature in features]}
+        
         label_features = {"input_ids": [feature["labels"] for feature in features]}
+        
+        file_ids = {"input_ids": [feature["file_id"] for feature in features]}
 
         # reformat list to dict and set to pytorch format
         batch = self.processor.feature_extractor.pad(
@@ -371,6 +327,13 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             return_tensors="pt",
         )
 
+        file_ids_batch = self.processor.tokenizer.pad(
+            file_ids,
+            max_length=self.max_target_length,
+            padding=self.target_padding,
+            return_tensors="pt",
+        )
+
         # replace padding with -100 to ignore correctly when computing the loss
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
 
@@ -380,6 +343,8 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             labels = labels[:, 1:]
 
         batch["labels"] = labels
+        batch["file_ids"] = file_ids_batch["input_ids"]
+
         return batch
 
 
@@ -496,19 +461,31 @@ def main():
     # 3. Load dataset
     raw_datasets = IterableDatasetDict() if data_args.streaming else DatasetDict()
     token = model_args.token if model_args.token is not None else HfFolder().get_token()
-
     data_splits = data_args.dataset_split_name.split("+")
-    for split in data_splits:
-        with accelerator.main_process_first():
-            raw_datasets[split] = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                split=split,
-                cache_dir=data_args.dataset_cache_dir,
-                token=token,
-                streaming=data_args.streaming,
-                num_proc=data_args.preprocessing_num_workers if not data_args.streaming else None,
-            )
+
+    if data_args.load_from_disk:
+        raw_datasets = datasets.load_from_disk(data_args.dataset_name)
+    else:
+        for split in data_splits:
+            if data_args.streaming:
+                raw_datasets[split] = load_dataset(
+                    data_args.dataset_name,
+                    data_args.dataset_config_name,
+                    split=split,
+                    cache_dir=data_args.dataset_cache_dir,
+                    token=token,
+                    streaming=True,
+                )
+            else:
+                raw_datasets[split] = load_dataset(
+                    data_args.dataset_name,
+                    data_args.dataset_config_name,
+                    split=split,
+                    cache_dir=data_args.dataset_cache_dir,
+                    token=token,
+                    streaming=False,
+                    num_proc=data_args.preprocessing_num_workers,
+                )
 
     if data_args.audio_column_name not in next(iter(raw_datasets.values())).column_names:
         raise ValueError(
@@ -525,7 +502,7 @@ def main():
             " correct text column - one of"
             f" {', '.join(next(iter(raw_datasets.values())).column_names)}."
         )
-    
+
     # 7. Load pretrained model, tokenizer, and feature extractor
     config = WhisperConfig.from_pretrained(
         (model_args.config_name if model_args.config_name else model_args.model_name_or_path),
@@ -552,7 +529,6 @@ def main():
         revision=model_args.model_revision,
         token=token,
     )
-
     model = WhisperForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
         config=config,
@@ -562,8 +538,19 @@ def main():
         token=token,
         low_cpu_mem_usage=True,
         torch_dtype=torch_dtype,
-        attn_implementation=model_args.attn_implementation,
+        use_flash_attention_2=model_args.attn_type == "flash_attn_2",
     )
+
+    if model_args.attn_type == "flash_attn":
+        model = model.to_bettertransformer()
+    elif model_args.attn_type not in [None, "flash_attn", "flash_attn_2"]:
+        raise ValueError(
+            f"Argument `attn_type` is set to {model_args.attn_type}. Should be one of:"
+            "1. `None`: default Transformers attention implementation."
+            "2. `flash_attn`: Flash Attention through PyTorch SDPA. Requires `torch>=2.0` and `optimum` to be installed. Recommended for hardware where Flash Attention 2 is not supported, e.g. Turing GPUs, (T4, RTX 2080)."
+            "3. `flash_attn_2`: Flash Attention 2 through the Flash Attention package https://github.com/Dao-AILab/flash-attention. **Always** recommended on supported hardware (Ampere, Ada, or Hopper GPUs, e.g., A100, RTX 3090, RTX 4090, H100)."
+        )
+
     model.eval()
 
     if model.config.decoder_start_token_id is None:
@@ -571,7 +558,6 @@ def main():
 
     return_timestamps = data_args.return_timestamps
     if hasattr(model.generation_config, "is_multilingual") and model.generation_config.is_multilingual:
-        is_multilingual = True
         # We need to set the language and task ids for multilingual checkpoints
         tokenizer.set_prefix_tokens(
             language=data_args.language, task=data_args.task, predict_timestamps=return_timestamps
@@ -581,8 +567,6 @@ def main():
             "Setting language token for an English-only checkpoint is not permitted. The language argument should "
             "only be set for multilingual checkpoints."
         )
-    else:
-        is_multilingual = False
 
     # 6. Resample speech dataset: `datasets` takes care of automatically loading and resampling the audio,
     # so we just need to set the correct target sampling rate.
@@ -593,128 +577,48 @@ def main():
 
     # 7. Preprocessing the datasets.
     # We need to read the audio files as arrays and tokenize the targets.
-    max_input_length = int(data_args.max_duration_in_seconds * feature_extractor.sampling_rate)
     max_label_length = (
         data_args.max_label_length if data_args.max_label_length is not None else model.config.max_length
     )
     audio_column_name = data_args.audio_column_name
-    sampling_rate = feature_extractor.sampling_rate
-
-    preprocessing_batch_size = data_args.preprocessing_batch_size
     num_workers = data_args.preprocessing_num_workers
     dataloader_num_workers = training_args.dataloader_num_workers
-
     text_column_name = data_args.text_column_name
     model_input_name = feature_extractor.model_input_names[0]
     id_column_name = data_args.id_column_name
-    speaker_id_column_name = data_args.speaker_id_column_name
     normalizer = (
-        BasicTextNormalizer()
-        if data_args.language is not None
-        else EnglishTextNormalizer(tokenizer.english_spelling_normalizer)
+        BasicTextNormalizer() if data_args.language is not None else EnglishTextNormalizer(tokenizer.english_spelling_normalizer)
     )
-
-    timestamp_position = 3 if is_multilingual else 1
-    decoder_prev_token_id = tokenizer.convert_tokens_to_ids("<|startofprev|>")
-    decoder_eot_token_id = tokenizer.eos_token_id
 
     if data_args.max_samples_per_split is not None:
         for split in data_splits:
             raw_datasets[split] = (
-                raw_datasets[split].take(data_args.max_samples_per_split)
+                raw_datasets[split].take(min(data_args.max_samples_per_split, len(raw_datasets[split])))
                 if data_args.streaming
-                else raw_datasets[split].select(range(data_args.max_samples_per_split))
+                else raw_datasets[split].select(range(min(data_args.max_samples_per_split, len(raw_datasets[split]))))
             )
+    
+    # train = raw_datasets['train']
+    
+    # df = pd.read_csv("data/masc_cv15_asc_fleurs_mgb5_mgb2_qasr_pseudo_labelled-v2-2M-225/train.csv",  converters={'whisper_transcript': literal_eval})
+    
 
-    if speaker_id_column_name is not None:
-        raw_datasets = raw_datasets.sort(speaker_id_column_name)
-
-    def concatenate_dataset(batch):
-        audio_arrays, texts, speaker_ids = [], [], []
-
-        # skip corrupted samples
-        for row in table_iter(batch.pa_table, batch_size=1):
-            row = batch.formatter.format_row(row)
-            try:
-                sample_audio = row[audio_column_name]['array']
-                sample_text = row[text_column_name]
-                sample_speaker_id = row[speaker_id_column_name] if speaker_id_column_name else None
-            except LibsndfileError:
-                logger.warning(f"{row[id_column_name]} is corrupted! Skipping sample.")
-                continue
-            audio_arrays.append(sample_audio)
-            texts.append(sample_text)
-            speaker_ids.append(sample_speaker_id)
-
-        # initialize concatenations
-        concat_audio = [audio_arrays[0]]
-        concat_text = [texts[0]]
-        concat_speaker_id = [speaker_ids[0]]
-        condition_on_prev = [0]
-
-        for audio_array, text, speaker_id in zip(audio_arrays[1:], texts[1:], speaker_ids[1:]):
-            is_same_speaker = speaker_id == concat_speaker_id[-1]
-            is_concatenable = len(audio_array) + len(concat_audio[-1]) <= max_input_length 
-            if is_same_speaker and is_concatenable:
-                # inplace concatenation
-                concat_audio[-1] = np.append(concat_audio[-1], audio_array)
-                concat_text[-1] = concat_text[-1] + " " + text
-            else:
-                concat_audio.append(audio_array)
-                concat_text.append(text)
-                concat_speaker_id.append(speaker_id)
-                condition_on_prev.append(1 if is_same_speaker else 0)   
-
-        batch[audio_column_name] = [{"array": array, "sampling_rate": sampling_rate} for array in concat_audio]
-        batch[text_column_name] = concat_text
-        batch[id_column_name] = concat_speaker_id
-        batch["condition_on_prev"] = condition_on_prev
-
-        return batch
-
-    raw_datasets_features = list(next(iter(raw_datasets.values())).features.keys())
-    if data_args.concatenate_audio and not data_args.streaming:
-        with accelerator.main_process_first():
-            raw_datasets = raw_datasets.map(
-                concatenate_dataset,
-                batched=True,
-                batch_size=preprocessing_batch_size,
-                num_proc=num_workers,
-                remove_columns=set(raw_datasets_features)
-                - {audio_column_name, text_column_name, id_column_name, "condition_on_prev"},
-                desc="Concatenating dataset...",
-            )
-
-        raw_datasets = raw_datasets.cast_column(
-            audio_column_name, datasets.features.Audio(sampling_rate=sampling_rate)
-        )
-        pretty_name = data_args.dataset_name.split("/")[-1]
-
-        def postprocess_ids(speaker_ids, indices):
-            speaker_ids_formatted = []
-            for speaker, idx in zip(speaker_ids, indices):
-                formatted_idx = f"{pretty_name}-{speaker}-{idx}" if speaker is not None else f"{pretty_name}-{idx}"
-                speaker_ids_formatted.append(formatted_idx)
-            return {id_column_name: speaker_ids_formatted}
-        
-        with accelerator.main_process_first():
-            raw_datasets = raw_datasets.map(
-                postprocess_ids,
-                input_columns=[id_column_name],
-                with_indices=True,
-                desc="Setting sample idxs...",
-                batched=True,
-                batch_size=preprocessing_batch_size,
-                num_proc=num_workers,
-            )
-    elif data_args.concatenate_audio and data_args.streaming:
-        raise ValueError(
-            "Streaming mode is not yet compatible with concatenating audios to `max_duration_in_seconds`."
-            "Either set `--streaming=False` and download the audios locally, or open an issue on the Distil-Whisper repo to request this feature."
-        )
+    # whisper_transcript = df['whisper_transcript'].values.tolist()
+    
+    # train = train.add_column("whisper_transcript", whisper_transcript)
+    
+    # dataset = datasets.load_from_disk("data/masc_cv15_asc_fleurs_mgb5_mgb2_qasr_pseudo_labelled-v2-500K-225")
+    
+    # train = train.cast(dataset['test'].features, num_proc=16)
+    
+    # new_dataset = datasets.DatasetDict({"train":train, "test":dataset['test'], 'validation':dataset['validation']})
+    
+    
+    # import pdb;pdb.set_trace()
 
     def prepare_dataset(batch):
         # process audio
+        # import pdb;pdb.set_trace()
         sample = batch[audio_column_name]
         inputs = feature_extractor(sample["array"], sampling_rate=sample["sampling_rate"])
         # process audio length
@@ -723,23 +627,22 @@ def main():
         # process targets
         input_str = batch[text_column_name]
         batch["labels"] = tokenizer(input_str, max_length=max_label_length, truncation=True).input_ids
+
+        # record the id of the sample as token ids
+        batch["file_id"] = tokenizer(batch[id_column_name], add_special_tokens=False).input_ids
         return batch
 
     raw_datasets_features = list(next(iter(raw_datasets.values())).features.keys())
-    file_ids_dataset = IterableDatasetDict() if data_args.streaming else DatasetDict()
-    for split in raw_datasets:
-        file_ids_dataset[split] = raw_datasets[split][id_column_name]
+    
     if data_args.streaming:
-        with accelerator.main_process_first():
-            vectorized_datasets = raw_datasets.map(prepare_dataset, remove_columns=raw_datasets_features)
+        vectorized_datasets = raw_datasets.map(prepare_dataset, remove_columns=raw_datasets_features)
     else:
-        with accelerator.main_process_first():
-            vectorized_datasets = raw_datasets.map(
-                prepare_dataset,
-                remove_columns=raw_datasets_features,
-                num_proc=num_workers,
-                desc="preprocess dataset",
-            )
+        vectorized_datasets = raw_datasets.map(
+            prepare_dataset,
+            remove_columns=raw_datasets_features,
+            num_proc=num_workers,
+            desc="preprocess dataset",
+        )
 
     # for large datasets it is advised to run the preprocessing on a
     # single machine first with `args.preprocessing_only` since there will mostly likely
@@ -760,29 +663,30 @@ def main():
 
     # Handle the repository creation
     output_dir = training_args.output_dir
-    if accelerator.is_main_process:
-        if training_args.push_to_hub:
-            if training_args.hub_model_id is None:
-                repo_name = get_full_repo_name(
-                    Path(output_dir).absolute().name,
-                    token=training_args.hub_token,
-                )
-            else:
-                repo_name = training_args.hub_model_id
-            create_repo(repo_name, repo_type="dataset", exist_ok=True, token=training_args.hub_token)
-            snapshot_download(repo_id=repo_name, local_dir=output_dir)
-
-            # Ensure large txt files can be pushed to the Hub with git-lfs
-            with open(os.path.join(output_dir, ".gitattributes"), "r+") as f:
-                git_lfs_extensions = f.read()
-                if "*.csv" not in git_lfs_extensions:
-                    f.write("*.csv filter=lfs diff=lfs merge=lfs -text")
-
-        elif output_dir is not None:
-            # this is where we'll save our transcriptions
-            os.makedirs(output_dir, exist_ok=True)
-
-    accelerator.wait_for_everyone()
+    if training_args.push_to_hub:
+        if training_args.hub_model_id is None:
+            repo_name = get_full_repo_name(
+                Path(output_dir).absolute().name,
+                token=token,
+            )
+        else:
+            repo_name = training_args.hub_model_id
+        create_repo(repo_name, exist_ok=True, token=token, repo_type="dataset", private=data_args.private_dataset)
+        repo = Repository(
+            output_dir,
+            clone_from=repo_name,
+            token=token,
+            repo_type="dataset",
+        )
+        # Ensure large txt files can be pushed to the Hub with git-lfs
+        with open(os.path.join(output_dir, ".gitattributes"), "r+") as f:
+            git_lfs_extensions = f.read()
+            if "*.csv" not in git_lfs_extensions:
+                f.write("*.csv filter=lfs diff=lfs merge=lfs -text")
+    else:
+        # this is where we'll save our transcriptions
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
 
     # 8. Load Metric
     metric = evaluate.load("wer")
@@ -792,9 +696,10 @@ def main():
         for idx in range(len(labels)):
             labels[idx][labels[idx] == -100] = tokenizer.pad_token_id
 
-        pred_str = tokenizer.batch_decode(preds, skip_special_tokens=False, decode_with_timestamps=return_timestamps)
+        pred_str = tokenizer.batch_decode(preds, skip_special_tokens=True, decode_with_timestamps=return_timestamps)
         # we do not want to group tokens when computing the metrics
         label_str = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        wer_ortho = 100 * metric.compute(predictions=pred_str, references=label_str)
 
         # normalize everything and re-compute the WER
         norm_pred_str = [normalizer(pred) for pred in pred_str]
@@ -809,15 +714,7 @@ def main():
 
         wer = 100 * metric.compute(predictions=norm_pred_str, references=norm_label_str)
 
-        return {"wer": wer}, pred_str, label_str, norm_pred_str, norm_label_str, file_ids
-
-    def filter_eot_tokens(preds):
-        for idx in range(len(preds)):
-            # remove the EOT tokens to get the 'true' token length
-            token_ids = [token for token in preds[idx] if token != decoder_eot_token_id]
-            token_ids = token_ids + [decoder_eot_token_id]
-            preds[idx] = token_ids
-        return preds
+        return {"wer": wer, "wer_ortho": wer_ortho}, pred_str, label_str, norm_pred_str, norm_label_str, file_ids
 
     # 12. Define Training Schedule
     per_device_eval_batch_size = int(training_args.per_device_eval_batch_size)
@@ -851,9 +748,6 @@ def main():
                 "task": data_args.task,
             }
         )
-    # remove any preset forced decoder ids since these are deprecated
-    model.generation_config.forced_decoder_ids = None
-    model.config.forced_decoder_ids = None
 
     # 15. Prepare everything with accelerate
     model = accelerator.prepare(model)
@@ -863,7 +757,6 @@ def main():
         eval_preds = []
         eval_labels = []
         eval_ids = []
-        pred_str = []
         eval_start = time.time()
 
         eval_loader = DataLoader(
@@ -873,11 +766,6 @@ def main():
             num_workers=dataloader_num_workers,
             pin_memory=True,
         )
-        file_loader = DataLoader(
-            file_ids_dataset[split],
-            batch_size=per_device_eval_batch_size * accelerator.num_processes,
-            num_workers=dataloader_num_workers,
-        )
 
         eval_loader = accelerator.prepare(eval_loader)
         batches = tqdm(eval_loader, desc=f"Evaluating {split}...", disable=not accelerator.is_local_main_process)
@@ -886,28 +774,34 @@ def main():
         split = split.replace(".", "-").split("/")[-1]
         output_csv = os.path.join(output_dir, f"{split}-transcription.csv")
 
-        for step, (batch, file_ids) in enumerate(zip(batches, file_loader)):
+        for step, batch in enumerate(batches):
+            
+            file_ids = batch.pop("file_ids")
+            
             # Generate predictions and pad to max generated length
             generate_fn = model.module.generate if accelerator.num_processes > 1 else model.generate
+            
+            # import pdb;pdb.set_trace()
+            
             generated_ids = generate_fn(batch["input_features"].to(dtype=torch_dtype), **gen_kwargs)
+            
             generated_ids = accelerator.pad_across_processes(generated_ids, dim=1, pad_index=tokenizer.pad_token_id)
             # Gather all predictions and targets
-            generated_ids, labels = accelerator.gather_for_metrics((generated_ids, batch["labels"]))
+            file_ids, generated_ids, labels = accelerator.gather_for_metrics((file_ids, generated_ids, batch["labels"]))
+            
             eval_preds.extend(generated_ids.cpu().numpy())
             eval_labels.extend(labels.cpu().numpy())
+            file_ids = tokenizer.batch_decode(file_ids, skip_special_tokens=True)
             eval_ids.extend(file_ids)
 
             if step % training_args.logging_steps == 0 and step > 0:
                 batches.write(f"Saving transcriptions for split {split} step {step}")
                 accelerator.wait_for_everyone()
-                pred_ids = eval_preds[-(len(eval_preds) - len(pred_str)) :]
-                pred_ids = filter_eot_tokens(pred_ids)
-                pred_str.extend(
-                    tokenizer.batch_decode(
-                        pred_ids, skip_special_tokens=False, decode_with_timestamps=return_timestamps
+                if data_args.decode_token_ids:
+                    eval_preds = tokenizer.batch_decode(
+                        eval_preds, skip_special_tokens=True, decode_with_timestamps=return_timestamps
                     )
-                )
-                csv_data = [[eval_ids[i], pred_str[i]] for i in range(len(eval_preds))]
+                csv_data = [[eval_ids[i], eval_preds[i]] for i in range(len(eval_preds))]
 
                 with open(output_csv, "w", encoding="UTF8", newline="") as f:
                     writer = csv.writer(f)
@@ -916,11 +810,9 @@ def main():
                     writer.writerows(csv_data)
 
                 if training_args.push_to_hub and accelerator.is_main_process:
-                    upload_folder(
-                        folder_path=output_dir,
-                        repo_id=repo_name,
-                        repo_type="dataset",
+                    repo.push_to_hub(
                         commit_message=f"Saving transcriptions for split {split} step {step}.",
+                        blocking=False,
                     )
 
         accelerator.wait_for_everyone()
@@ -929,7 +821,6 @@ def main():
         # compute WER metric for eval sets
         wer_desc = ""
         if "validation" in split or "test" in split:
-            eval_preds = filter_eot_tokens(eval_preds)
             wer_metric, pred_str, label_str, norm_pred_str, norm_label_str, eval_ids = compute_metrics(
                 eval_preds, eval_labels, eval_ids
             )
@@ -949,11 +840,11 @@ def main():
                 norm_label_str,
                 prefix=split,
             )
-        else:
-            pred_ids = eval_preds[-(len(eval_preds) - len(pred_str)) :]
-            pred_ids = filter_eot_tokens(pred_ids)
-            pred_str.extend(
-                tokenizer.batch_decode(pred_ids, skip_special_tokens=False, decode_with_timestamps=return_timestamps)
+            if data_args.decode_token_ids:
+                eval_preds = pred_str
+        elif data_args.decode_token_ids:
+            eval_preds = tokenizer.batch_decode(
+                eval_preds, skip_special_tokens=True, decode_with_timestamps=return_timestamps
             )
 
         batches.write(f"Saving final transcriptions for split {split}.")
@@ -968,31 +859,7 @@ def main():
         logger.info(wer_desc)
 
         if not data_args.streaming:
-            raw_datasets[split] = raw_datasets[split].add_column("whisper_transcript", pred_str)
-            raw_datasets[split] = raw_datasets[split].add_column("eval_preds", eval_preds)
-
-            def add_concatenated_text(eval_preds, condition_on_prev):
-                concatenated_prev = [None]
-                for token_ids, condition in zip(eval_preds[:-1], condition_on_prev[1:]):
-                    if condition is False:
-                        concatenated_prev.append(None)
-                    else:
-                        prompt_ids = [token for token in token_ids if token != decoder_eot_token_id]
-                        prompt_ids = [decoder_prev_token_id] + prompt_ids[timestamp_position:]
-                        concatenated_prev.append(prompt_ids)
-                return {"condition_on_prev": concatenated_prev}
-
-            if data_args.concatenate_audio:
-                with accelerator.main_process_first():
-                    raw_datasets[split] = raw_datasets[split].map(
-                        add_concatenated_text,
-                        input_columns=["eval_preds", "condition_on_prev"],
-                        remove_columns=["eval_preds"],
-                        desc="Setting condition on prev...",
-                        batched=True,
-                        batch_size=preprocessing_batch_size,
-                        num_proc=num_workers,
-                    )
+            raw_datasets[split] = raw_datasets[split].add_column("whisper_transcript", eval_preds)
 
     logger.info("***** Running Labelling *****")
     logger.info("  Instantaneous batch size per device =" f" {training_args.per_device_eval_batch_size}")
@@ -1000,15 +867,15 @@ def main():
         f"  Total eval batch size (w. parallel & distributed) = {training_args.per_device_eval_batch_size * accelerator.num_processes}"
     )
     logger.info(f"  Predict labels with timestamps = {return_timestamps}")
+    logger.info(f"  Decode labels to transcriptions = {data_args.decode_token_ids}")
+    
     for split in data_splits:
         eval_step_with_save(split=split)
         accelerator.wait_for_everyone()
         if training_args.push_to_hub and accelerator.is_main_process:
-            upload_folder(
-                folder_path=output_dir,
-                repo_id=repo_name,
-                repo_type="dataset",
+            repo.push_to_hub(
                 commit_message=f"Saving final transcriptions for split {split.replace('.', '-').split('/')[-1]}",
+                blocking=False,
             )
     if not data_args.streaming and accelerator.is_main_process:
         raw_datasets.save_to_disk(output_dir, num_proc=num_workers)
